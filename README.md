@@ -1,52 +1,130 @@
-# ITAD Labs
+# ITAD Labs — ЛР №2
 
 Сквозной учебный data-проект курса «Информационные технологии анализа данных».
 
-## Контур данных
+## Проект лабораторной работы
+
+Тема проекта из ЛР №1: **влияние сезонных и погодных условий на спрос на прокат велосипедов**.
+
+Основной источник проекта по ЛР №1: **Bike Sharing Dataset**, UCI Machine Learning Repository. Основной файл проекта — `hour.csv` с
+почасовой детализацией. Это соответствует Project Brief ЛР №1.
+
+В ходе выполнения ЛР №2 исходный старый HTTP-адрес UCI из каркаса вернул `404 Not Found`. Согласно заданию преподавателя,
+при недоступности первоисточника разрешён HTTP-fallback через GitHub raw URL, закреплённый за конкретным commit SHA.
+Для воспроизводимого fallback используется `hour.csv` из репозитория `alfozan/mlflow-example`, commit
+`fa1ed37c09962d5b134d07703ba95f07648b73e0`. В README этого репозитория файл указан как Bike Sharing Dataset от UCI.
+
+## Контур ЛР №2
 
 ```text
-Источник → raw в SeaweedFS → staging → mart → анализ и отчёт.
+HTTP-источник hour.csv
+        ↓
+HttpSensor в Airflow
+        ↓
+PythonOperator / S3Hook
+        ↓
+SeaweedFS: raw/bike-sharing/ingested_on=<логическая дата>/hour.csv
+        ↓
+DuckDB читает raw-файл напрямую
 ```
 
-SeaweedFS хранит файлы. Airflow ожидает и скачивает HTTP-источник. PostgreSQL используется только как база метаданных
-Airflow. DuckDB читает и записывает Parquet-объекты в SeaweedFS, а dbt задаёт SQL-модели. dbt запускается через `uv`, а не
-как отдельный Docker-сервис.
+В этой лабораторной работе реализуется только перенос исходных байтов в `raw`. Очистка, staging, mart и аналитические
+расчёты не выполняются.
 
-SeaweedFS работает в одном контейнере в режиме `weed mini`. При запуске entrypoint готовит права тома и
-переключается на пользователя `seaweed`, а `S3_BUCKET=raw,staging,mart` обеспечивает создание недостающих бакетов.
-Существующие объекты сохраняются. Healthcheck проверяет подписанным S3-запросом доступность каждого бакета.
-Размер внутренних томов SeaweedFS задан равным 256 МиБ, чтобы на небольшом локальном диске хватало томов для
-служебных данных и всех трёх бакетов. Это не ограничение общего размера бакета.
+## 1. Подготовка проекта
 
-После успешной проверки airflow scheduler применяет миграции метабазы и создаёт администратора из `.env`, затем начинает
-работу. Airflow webserver запускается после успешной проверки heartbeat scheduler. Отдельные init-сервисы не нужны.
+Создайте `.env` из `.env.example` и не коммитьте его:
 
-Используются стандартные порты SeaweedFS: S3 API доступен на `http://localhost:8333`, а файловый интерфейс — по адресу
-`http://localhost:8888/buckets/`; в нём видны бакеты и их объекты. На хосте используются `S3_ENDPOINT`,
-`S3_ACCESS_KEY` и `S3_SECRET_KEY` из `.env`, а Airflow получает подключение `s3_conn` с адресом
-`http://seaweedfs:8333` внутри сети Compose.
+```bash
+cp .env.example .env
+```
 
-## Команды
+В PowerShell:
 
-Команды ниже работают одинаково в PowerShell, macOS и Linux. Для `dbt` предварительно скопируйте
-`dbt/profiles.yml.example` в `dbt/profiles.yml`.
+```powershell
+Copy-Item .env.example .env
+```
+
+Затем установите зависимости:
+
+```bash
+uv sync --locked
+```
+
+## 2. Локальный снимок источника
+
+По заданию преподавателя копия исходного файла хранится в `data/source/`.
+
+```bash
+uv run python scripts/download_source.py
+uv run python scripts/verify_source.py
+```
+
+`data/source/hour.csv` не изменяется кодом ingestion и нужен только как ручной резервный snapshot.
+
+## 3. Запуск инфраструктуры
+
+```bash
+docker compose up --build -d
+```
+
+После запуска:
+
+- Airflow: http://localhost:8080/
+- SeaweedFS: http://localhost:8888/buckets/
+- S3 API SeaweedFS: http://localhost:8333
+
+Учётные данные Airflow и S3 берутся из `.env`.
+
+## 4. Запуск DAG
+
+В Airflow откройте DAG `ingest_raw`, включите его и запустите вручную.
+
+DAG выполняет две задачи:
+
+1. `wait_for_primary_source` — проверяет доступность HTTP-источника через `HttpSensor` с интервалом 60 секунд и
+   таймаутом 600 секунд.
+2. `load_to_raw` — скачивает исходные байты через HTTP и сохраняет их в `raw` через S3 API.
+
+Объект имеет ключ:
+
+```text
+s3://raw/bike-sharing/ingested_on=<logical-date>/hour.csv
+```
+
+Повторный запуск за ту же логическую дату не создаёт новый объект и не перезаписывает существующий raw-файл.
+
+## 5. Проверка через DuckDB
+
+После успешного запуска DAG используйте путь к объекту из SeaweedFS:
+
+```bash
+uv run --env-file .env python scripts/read_raw.py --path "s3://raw/bike-sharing/ingested_on=YYYY-MM-DD/hour.csv"
+```
+
+Команда читает файл непосредственно из SeaweedFS и выводит названия столбцов и первые пять строк.
+
+Проверка не создаёт таблицы, staging-файлы или дополнительные объекты в хранилище.
+
+## 6. Проверка кода
 
 ```bash
 uv run ruff check .
-
-docker compose up --build -d
-uv run --env-file .env dbt debug --project-dir dbt --profiles-dir dbt
-uv run --env-file .env dbt build --project-dir dbt --profiles-dir dbt
-uv run --env-file .env python scripts/read_raw.py --path "s3://raw/green_tripdata/ingested_on=2026-01-01/green_tripdata_2025-01.parquet"
-docker compose down
 ```
 
-## Структура
+## 7. Что приложить к Pull Request
 
-- `config/` — будущие правила качества.
-- `data/source/` — неизменяемые Git-снимки для ручного fallback.
-- `airflow/dags/` — DAG'и оркестрации.
-- `src/` — код ingestion, проверки и анализа.
-- `scripts/` — кроссплатформенные точки входа для локальных проверок.
-- `dbt/` — dbt-модели, материализуемые во внешние Parquet-файлы SeaweedFS.
-- `infra/` — место для инфраструктурных материалов следующих лабораторных работ.
+Согласно заданию ЛР №2, приложите:
+
+- копию `hour.csv` в `data/source/`;
+- `docs/project_brief.md` из ЛР №1;
+- код DAG `airflow/dags/ingest_raw.py`;
+- подтверждение запуска `docker compose up --build -d`;
+- скриншот успешного графа `ingest_raw` в Airflow;
+- скриншот объекта в бакете `raw` SeaweedFS с путём `ingested_on=...`;
+- подтверждение успешного чтения `hour.csv` через DuckDB.
+
+## Источник
+
+Источник и описание набора зафиксированы в `docs/project_brief.md`. В рамках ЛР №1 для проекта выбран Bike Sharing
+Dataset UCI, а `hour.csv` указан как основной файл для анализа.
